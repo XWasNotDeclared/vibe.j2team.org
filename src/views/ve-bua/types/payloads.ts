@@ -6,6 +6,12 @@ export type PaperTransform = {
   scale: number
 }
 
+export type DrawingTransform = {
+  offsetX: number
+  offsetY: number
+  scale: number
+}
+
 export type BuaStylePayloadV1 = {
   version: 1
   createdAt: string

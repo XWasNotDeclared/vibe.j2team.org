@@ -18,11 +18,18 @@ export type BrushSettings = {
   brushSizeRandomness: number
   brushOpacityRandomness: number
   freeDraw: boolean
+  tool?: 'draw' | 'erase'
 }
 
 export type AxisSnapshot = {
   center: Point01
   axisAngles: number[]
+}
+
+export type PointsDelta = {
+  scale: number
+  start: readonly [number, number]
+  deltas: number[]
 }
 
 export type BrushKeyframe = {
@@ -42,12 +49,16 @@ export type StrokeRecord = {
   }
 }
 
+export type StrokeRecordEncoded = Omit<StrokeRecord, 'points'> & {
+  pointsDelta: PointsDelta
+}
+
 export type BuaDrawingPayloadV2 = {
   version: 2
   createdAt: string
   name: string
   drawableBox: DrawableBox
-  strokes: StrokeRecord[]
+  strokes: StrokeRecordEncoded[]
 }
 
 export type DrawingStats = {
