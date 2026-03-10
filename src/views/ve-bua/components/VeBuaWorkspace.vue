@@ -1,6 +1,7 @@
 ﻿<script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { RouterLink } from 'vue-router'
+import { useIntervalFn } from '@vueuse/core'
 import BuaActionMenuPanel from './BuaActionMenuPanel.vue'
 import BuaAxisPanel from './BuaAxisPanel.vue'
 import BuaBrushPanel from './BuaBrushPanel.vue'
@@ -14,6 +15,13 @@ import BuaImportModal from './BuaImportModal.vue'
 import BuaMandalaPaper from './BuaMandalaPaper.vue'
 import BuaMokPanel from './BuaMokPanel.vue'
 import BuaPatternBg from './BuaPatternBg.vue'
+import type { BuaDrawingPayloadV2, DrawingStats, StrokeRecord } from '../types/drawing'
+import {
+  deleteCollectionRecord,
+  getAllCollectionRecords,
+  putCollectionRecord,
+  type VeBuaCollectionRecord,
+} from '../utils/veBuaIdb'
 
 type Point = {
   x: number
@@ -64,7 +72,7 @@ type BuaStylePayload = {
   }
 }
 
-type BuaDrawingPayload = {
+type BuaDrawingPayloadV1 = {
   version: 1
   createdAt: string
   name: string
@@ -87,7 +95,11 @@ type PaperApi = {
   resetAxesEven: () => void
   getSnapshot: () => PaperSnapshot
   getDrawingDataUrl: () => string
+  getDrawingStrokes: () => StrokeRecord[]
+  getDrawingStats: () => DrawingStats
+  getPreviewBlob: (maxWidth?: number) => Promise<Blob | null>
   applyDrawingDataUrl: (dataUrl: string) => Promise<void>
+  applyDrawingStrokes: (strokes: StrokeRecord[], drawableBox?: DrawableBox | null) => Promise<void>
   applySnapshot: (snapshot: PaperSnapshot) => Promise<void>
 }
 
@@ -109,15 +121,16 @@ type LegacyCollectionItem = {
 type CollectionPreview = {
   id: string
   name: string
-  styleCode: string
-  drawingCode: string
   createdAt: string
-  stylePayload: BuaStylePayload | null
-  drawingPayload: BuaDrawingPayload | null
+  stylePayload: BuaStylePayload
+  drawingPayload: BuaDrawingPayloadV1 | BuaDrawingPayloadV2
+  previewSrc: string | null
+  stats: DrawingStats | null
 }
 
 const STORAGE_KEY = 've-bua-collection-v3'
 const LEGACY_STORAGE_KEY = 've-bua-collection-v1'
+const MIGRATION_FLAG_KEY = 've-bua-collection-idb-migrated-v1'
 const PAPER_TRANSFORM_KEY = 've-bua-paper-transform-v1'
 
 const paperRef = ref<PaperApi | null>(null)
@@ -169,8 +182,9 @@ const creditsOffsetY = ref(0)
 const creditsBoosting = ref(false)
 const creditsContainerRef = ref<HTMLElement | null>(null)
 const creditsContentRef = ref<HTMLElement | null>(null)
-const collection = ref<CollectionItem[]>(loadCollection())
-const collectionPreviews = ref<CollectionPreview[]>(buildCollectionPreviews(collection.value))
+const collectionPreviews = ref<CollectionPreview[]>([])
+const collectionPreviewUrls = new Map<string, string>()
+const drawingStats = ref<DrawingStats | null>(null)
 
 const CHANT_SAMPLES = [
   'Nam mô hộ pháp, xin cho công việc hanh thông, bug tiêu tán.',
@@ -191,12 +205,39 @@ let creditsLastFrame = 0
 let mokLoopTimeout = 0
 let mokAudioContext: AudioContext | null = null
 
+function syncDrawingStats() {
+  drawingStats.value = paperRef.value?.getDrawingStats() ?? null
+}
+
+const { pause: pauseStatsLoop, resume: resumeStatsLoop } = useIntervalFn(
+  () => {
+    if (showMenu.value) syncDrawingStats()
+  },
+  350,
+  { immediate: true },
+)
+
+watch(
+  showMenu,
+  (open) => {
+    if (open) {
+      syncDrawingStats()
+      resumeStatsLoop()
+      return
+    }
+    pauseStatsLoop()
+  },
+  { immediate: true },
+)
+
 function clearDrawing() {
   paperRef.value?.clearDrawing()
+  drawingStats.value = paperRef.value?.getDrawingStats() ?? null
 }
 
 async function undoDrawing() {
   const restored = await paperRef.value?.undoLastStroke()
+  drawingStats.value = paperRef.value?.getDrawingStats() ?? null
   if (!restored) {
     infoText.value = 'Không còn bước vẽ nào để hoàn tác.'
   }
@@ -522,7 +563,7 @@ function createStylePayload(name: string): BuaStylePayload | null {
   }
 }
 
-function createDrawingPayload(name: string): BuaDrawingPayload | null {
+function createDrawingPayloadV1(name: string): BuaDrawingPayloadV1 | null {
   const paper = paperRef.value
   if (!paper) return null
   return {
@@ -530,6 +571,18 @@ function createDrawingPayload(name: string): BuaDrawingPayload | null {
     createdAt: new Date().toISOString(),
     name,
     drawingDataUrl: paper.getDrawingDataUrl(),
+  }
+}
+
+function createDrawingPayloadV2(name: string): BuaDrawingPayloadV2 | null {
+  const paper = paperRef.value
+  if (!paper) return null
+  return {
+    version: 2,
+    createdAt: new Date().toISOString(),
+    name,
+    drawableBox: { ...drawableBox.value },
+    strokes: paper.getDrawingStrokes(),
   }
 }
 
@@ -556,8 +609,12 @@ function encodeStyleCode(payload: BuaStylePayload): string {
   return `BUA-S1.${encodeBase64Url(JSON.stringify(payload))}`
 }
 
-function encodeDrawingCode(payload: BuaDrawingPayload): string {
+function encodeDrawingCodeV1(payload: BuaDrawingPayloadV1): string {
   return `BUA-D1.${encodeBase64Url(JSON.stringify(payload))}`
+}
+
+function encodeDrawingCodeV2(payload: BuaDrawingPayloadV2): string {
+  return `BUA-D2.${encodeBase64Url(JSON.stringify(payload))}`
 }
 
 function isValidSnapshot(snapshot: PaperSnapshot): boolean {
@@ -638,10 +695,17 @@ function isValidStylePayload(payload: BuaStylePayload): boolean {
   })
 }
 
-function isValidDrawingPayload(payload: BuaDrawingPayload): boolean {
+function isValidDrawingPayloadV1(payload: BuaDrawingPayloadV1): boolean {
   return (
     payload.version === 1 && payload.name.length > 0 && typeof payload.drawingDataUrl === 'string'
   )
+}
+
+function isValidDrawingPayloadV2(payload: BuaDrawingPayloadV2): boolean {
+  if (payload.version !== 2) return false
+  if (!payload.name || payload.name.length < 1) return false
+  if (!isValidDrawableBox(payload.drawableBox)) return false
+  return Array.isArray(payload.strokes)
 }
 
 function decodeLegacyBuaCode(code: string): BuaExportPayload | null {
@@ -672,35 +736,32 @@ function decodeStyleCode(code: string): BuaStylePayload | null {
   }
 }
 
-function decodeDrawingCode(code: string): BuaDrawingPayload | null {
+function decodeDrawingCode(code: string): BuaDrawingPayloadV1 | BuaDrawingPayloadV2 | null {
   const trimmed = code.trim()
-  if (!trimmed.startsWith('BUA-D1.')) return null
-  const encoded = trimmed.slice(7)
+  const prefixV1 = 'BUA-D1.'
+  const prefixV2 = 'BUA-D2.'
+  const prefix = trimmed.startsWith(prefixV1)
+    ? prefixV1
+    : trimmed.startsWith(prefixV2)
+      ? prefixV2
+      : null
+  if (!prefix) return null
+  const encoded = trimmed.slice(prefix.length)
   if (!encoded) return null
   try {
     const raw = decodeBase64Url(encoded)
-    const payload = JSON.parse(raw) as BuaDrawingPayload
-    return isValidDrawingPayload(payload) ? payload : null
+    if (prefix === prefixV1) {
+      const payload = JSON.parse(raw) as BuaDrawingPayloadV1
+      return isValidDrawingPayloadV1(payload) ? payload : null
+    }
+    const payload = JSON.parse(raw) as BuaDrawingPayloadV2
+    return isValidDrawingPayloadV2(payload) ? payload : null
   } catch {
     return null
   }
 }
 
-function refreshCollection(next: CollectionItem[]) {
-  collection.value = next
-  saveCollection()
-  collectionPreviews.value = buildCollectionPreviews(next)
-}
-
-function saveCollection() {
-  try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(collection.value))
-  } catch {
-    infoText.value = 'Không thể lưu vào bộ nhớ trình duyệt.'
-  }
-}
-
-function loadCollection(): CollectionItem[] {
+function loadCollectionFromLocalStorage(): CollectionItem[] {
   try {
     const raw = localStorage.getItem(STORAGE_KEY)
     if (raw) {
@@ -729,7 +790,7 @@ function loadCollection(): CollectionItem[] {
               axisAngles: legacy.snapshot.axisAngles.slice(),
             },
           }
-          const drawingPayload: BuaDrawingPayload = {
+          const drawingPayload: BuaDrawingPayloadV1 = {
             version: 1,
             createdAt: legacy.createdAt,
             name: legacy.name,
@@ -740,7 +801,7 @@ function loadCollection(): CollectionItem[] {
             name: item.name,
             createdAt: item.createdAt,
             styleCode: encodeStyleCode(stylePayload),
-            drawingCode: encodeDrawingCode(drawingPayload),
+            drawingCode: encodeDrawingCodeV1(drawingPayload),
           }
         })
         .filter((item): item is CollectionItem => item !== null)
@@ -765,7 +826,7 @@ function loadCollection(): CollectionItem[] {
             axisAngles: item.payload.snapshot.axisAngles.slice(),
           },
         }
-        const drawingPayload: BuaDrawingPayload = {
+        const drawingPayload: BuaDrawingPayloadV1 = {
           version: 1,
           createdAt: item.createdAt,
           name: item.name,
@@ -776,7 +837,7 @@ function loadCollection(): CollectionItem[] {
           name: item.name,
           createdAt: item.createdAt,
           styleCode: encodeStyleCode(stylePayload),
-          drawingCode: encodeDrawingCode(drawingPayload),
+          drawingCode: encodeDrawingCodeV1(drawingPayload),
         }
       })
       .slice(0, 60)
@@ -787,19 +848,85 @@ function loadCollection(): CollectionItem[] {
   }
 }
 
-function buildCollectionPreviews(items: CollectionItem[]): CollectionPreview[] {
-  return items.map((item) => ({
-    id: item.id,
-    name: item.name,
-    styleCode: item.styleCode,
-    drawingCode: item.drawingCode,
-    createdAt: item.createdAt,
-    stylePayload: decodeStyleCode(item.styleCode),
-    drawingPayload: decodeDrawingCode(item.drawingCode),
-  }))
+function revokeCollectionPreviewUrls() {
+  for (const url of collectionPreviewUrls.values()) {
+    URL.revokeObjectURL(url)
+  }
+  collectionPreviewUrls.clear()
 }
 
-function saveDesign() {
+function buildCollectionPreviewsFromRecords(records: VeBuaCollectionRecord[]): CollectionPreview[] {
+  revokeCollectionPreviewUrls()
+  const ordered = records.slice().sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+  return ordered.map((record) => {
+    let previewSrc: string | null = null
+    if (record.previewBlob) {
+      const url = URL.createObjectURL(record.previewBlob)
+      collectionPreviewUrls.set(record.id, url)
+      previewSrc = url
+    } else if (record.drawingPayload.version === 1 && record.drawingPayload.drawingDataUrl) {
+      previewSrc = record.drawingPayload.drawingDataUrl
+    }
+    return {
+      id: record.id,
+      name: record.name,
+      createdAt: record.createdAt,
+      stylePayload: record.stylePayload,
+      drawingPayload: record.drawingPayload,
+      previewSrc,
+      stats: record.stats,
+    }
+  })
+}
+
+async function loadCollectionFromDb() {
+  const records = await getAllCollectionRecords()
+  collectionPreviews.value = buildCollectionPreviewsFromRecords(records)
+}
+
+async function enforceCollectionLimit(limit: number) {
+  const records = await getAllCollectionRecords()
+  const ordered = records.slice().sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+  const extra = ordered.slice(limit)
+  for (const record of extra) {
+    await deleteCollectionRecord(record.id)
+  }
+}
+
+async function migrateLocalStorageCollectionIfNeeded() {
+  if (localStorage.getItem(MIGRATION_FLAG_KEY) === '1') return
+  const existing = await getAllCollectionRecords()
+  if (existing.length > 0) {
+    localStorage.setItem(MIGRATION_FLAG_KEY, '1')
+    return
+  }
+  const items = loadCollectionFromLocalStorage()
+  if (items.length === 0) {
+    localStorage.setItem(MIGRATION_FLAG_KEY, '1')
+    return
+  }
+  for (const item of items) {
+    const stylePayload = decodeStyleCode(item.styleCode)
+    const drawingPayload = decodeDrawingCode(item.drawingCode)
+    if (!stylePayload || !drawingPayload) continue
+    const record: VeBuaCollectionRecord = {
+      id: item.id,
+      name: item.name,
+      createdAt: item.createdAt,
+      stylePayload,
+      drawingPayload,
+      previewBlob: null,
+      stats: null,
+    }
+    await putCollectionRecord(record)
+  }
+  localStorage.removeItem(STORAGE_KEY)
+  localStorage.removeItem(LEGACY_STORAGE_KEY)
+  localStorage.removeItem('ve-bua-collection-v2')
+  localStorage.setItem(MIGRATION_FLAG_KEY, '1')
+}
+
+async function saveDesign() {
   const trimmed = designName.value.trim()
   if (!trimmed) {
     infoText.value = 'Hãy nhập tên thiết kế trước khi lưu.'
@@ -807,21 +934,33 @@ function saveDesign() {
   }
 
   const stylePayload = createStylePayload(trimmed)
-  const drawingPayload = createDrawingPayload(trimmed)
-  if (!stylePayload || !drawingPayload) {
+  const paper = paperRef.value
+  const drawingPayloadV2 = createDrawingPayloadV2(trimmed)
+  const drawingPayload =
+    drawingPayloadV2 && drawingPayloadV2.strokes.length > 0
+      ? drawingPayloadV2
+      : createDrawingPayloadV1(trimmed)
+  if (!stylePayload || !drawingPayload || !paper) {
     infoText.value = 'Không lấy được dữ liệu bùa hiện tại.'
     return
   }
 
-  const item: CollectionItem = {
+  const stats = paper.getDrawingStats()
+  const previewBlob = await paper.getPreviewBlob(260)
+
+  const record: VeBuaCollectionRecord = {
     id: `${Date.now()}-${Math.round(Math.random() * 100000)}`,
     name: trimmed,
-    styleCode: encodeStyleCode(stylePayload),
-    drawingCode: encodeDrawingCode(drawingPayload),
     createdAt: stylePayload.createdAt,
+    stylePayload,
+    drawingPayload,
+    previewBlob,
+    stats,
   }
 
-  refreshCollection([item, ...collection.value].slice(0, 60))
+  await putCollectionRecord(record)
+  await enforceCollectionLimit(60)
+  await loadCollectionFromDb()
   infoText.value = `Đã lưu "${trimmed}" vào bộ sưu tập.`
 }
 
@@ -839,12 +978,17 @@ function openExportModal(mode: 'style' | 'drawing') {
     infoText.value = 'Đã tạo mã style.'
     return
   }
-  const payload = createDrawingPayload(name)
-  if (!payload) {
-    infoText.value = 'Không thể tạo mã lúc này.'
-    return
+  const payloadV2 = createDrawingPayloadV2(name)
+  if (payloadV2 && payloadV2.strokes.length > 0) {
+    exportCodeText.value = encodeDrawingCodeV2(payloadV2)
+  } else {
+    const payloadV1 = createDrawingPayloadV1(name)
+    if (!payloadV1) {
+      infoText.value = 'Không thể tạo mã lúc này.'
+      return
+    }
+    exportCodeText.value = encodeDrawingCodeV1(payloadV1)
   }
-  exportCodeText.value = encodeDrawingCode(payload)
   showExportModal.value = true
   infoText.value = 'Đã tạo mã nét vẽ.'
 }
@@ -879,8 +1023,12 @@ async function applyStylePayload(payload: BuaStylePayload) {
   })
 }
 
-async function applyDrawingPayload(payload: BuaDrawingPayload) {
-  await paperRef.value?.applyDrawingDataUrl(payload.drawingDataUrl)
+async function applyDrawingPayload(payload: BuaDrawingPayloadV1 | BuaDrawingPayloadV2) {
+  if (payload.version === 1) {
+    await paperRef.value?.applyDrawingDataUrl(payload.drawingDataUrl)
+    return
+  }
+  await paperRef.value?.applyDrawingStrokes(payload.strokes, payload.drawableBox)
 }
 
 async function importFromCodeText(rawCode: string) {
@@ -942,26 +1090,12 @@ async function copyExportCode() {
   }
 }
 
-async function loadFromCollection(item: CollectionItem, mode: 'style' | 'drawing' | 'both') {
-  const stylePayload = decodeStyleCode(item.styleCode)
-  const drawingPayload = decodeDrawingCode(item.drawingCode)
-  if ((mode === 'style' || mode === 'both') && stylePayload) {
-    await applyStylePayload(stylePayload)
+async function loadFromCollection(item: CollectionPreview, mode: 'style' | 'drawing' | 'both') {
+  if (mode === 'style' || mode === 'both') {
+    await applyStylePayload(item.stylePayload)
   }
-  if ((mode === 'drawing' || mode === 'both') && drawingPayload) {
-    await applyDrawingPayload(drawingPayload)
-  }
-  if (mode === 'style' && !stylePayload) {
-    infoText.value = `Style của "${item.name}" bị lỗi.`
-    return
-  }
-  if (mode === 'drawing' && !drawingPayload) {
-    infoText.value = `Nét vẽ của "${item.name}" bị lỗi.`
-    return
-  }
-  if (mode === 'both' && !stylePayload && !drawingPayload) {
-    infoText.value = `Dữ liệu của "${item.name}" bị lỗi.`
-    return
+  if (mode === 'drawing' || mode === 'both') {
+    await applyDrawingPayload(item.drawingPayload)
   }
   designName.value = item.name
   showCollection.value = false
@@ -973,8 +1107,9 @@ async function loadFromCollection(item: CollectionItem, mode: 'style' | 'drawing
         : `Đã nạp nét vẽ: ${item.name}`
 }
 
-function removeFromCollection(id: string) {
-  refreshCollection(collection.value.filter((item) => item.id !== id))
+async function removeFromCollection(id: string) {
+  await deleteCollectionRecord(id)
+  await loadCollectionFromDb()
 }
 
 function useSampleChant(text: string) {
@@ -998,6 +1133,7 @@ function handleGlobalKeydown(event: KeyboardEvent) {
 
 onMounted(() => {
   window.addEventListener('keydown', handleGlobalKeydown)
+  void migrateLocalStorageCollectionIfNeeded().then(loadCollectionFromDb)
   const frame = (timestamp: number) => {
     tickCredits(timestamp)
     creditsRaf = window.requestAnimationFrame(frame)
@@ -1041,6 +1177,8 @@ watch(
 
 onBeforeUnmount(() => {
   window.removeEventListener('keydown', handleGlobalKeydown)
+  revokeCollectionPreviewUrls()
+  pauseStatsLoop()
   if (chantHideTimeout) {
     window.clearTimeout(chantHideTimeout)
   }
@@ -1600,6 +1738,7 @@ onBeforeUnmount(() => {
           :open="showMenu && !isBurning && !isPostBurnHolding"
           :design-name="designName"
           :info-text="infoText"
+          :drawing-stats="drawingStats"
           @update:design-name="designName = $event"
           @save-design="saveDesign"
           @open-credits="openCreditsModal"

@@ -3,6 +3,8 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 
 import nenGiayImage from '../res/nenGiay.png'
 import vienBuaImage from '../res/vienBua.png'
+import type { BrushSettings, DrawingStats, Point01, StrokeRecord } from '../types/drawing'
+import { createRng, randomSeed, type Rng } from '../utils/rng'
 
 type Point = {
   x: number
@@ -85,7 +87,6 @@ const paperHeight = ref(0)
 const axisAngles = ref<number[]>([])
 const isDrawing = ref(false)
 const lastPoint = ref<Point | null>(null)
-const strokeStartSnapshot = ref<string | null>(null)
 const hasStrokeChanges = ref(false)
 const isBurning = ref(false)
 const burnProgress = ref(0)
@@ -93,8 +94,13 @@ const activeDrag = ref<'none' | 'center' | 'axis'>('none')
 const draggedAxisIndex = ref(-1)
 const center = ref<Point>({ x: 0.5, y: 0.74 })
 const burnTrailParticles = ref<BurnParticle[]>([])
-const undoStack = ref<string[]>([])
-const UNDO_LIMIT = 5
+const baseRasterDataUrl = ref('')
+const strokes = ref<StrokeRecord[]>([])
+const activeStroke = ref<{
+  record: StrokeRecord
+  rng: Rng
+  lastBrush: BrushSettings
+} | null>(null)
 
 const drawableDragMode = ref<'none' | 'move' | 'nw' | 'ne' | 'sw' | 'se'>('none')
 const drawableStartPoint = ref<Point | null>(null)
@@ -105,6 +111,8 @@ const paperTransformStart = ref<PaperTransform | null>(null)
 const paperTransformStartDistance = ref(1)
 const paperTransformStartClient = ref<Point | null>(null)
 const paperTransformCenterClient = ref<Point | null>(null)
+const transformCacheBitmap = ref<ImageBitmap | null>(null)
+const transformCacheCanvas = ref<HTMLCanvasElement | null>(null)
 
 let resizeObserver: ResizeObserver | null = null
 let burnRaf = 0
@@ -211,6 +219,21 @@ function resizeCanvas() {
   ctx.setTransform(ratio, 0, 0, ratio, 0, 0)
   ctx.lineCap = 'round'
   ctx.lineJoin = 'round'
+  if (
+    props.showPaperTransformEditor &&
+    (transformCacheBitmap.value || transformCacheCanvas.value)
+  ) {
+    ctx.clearRect(0, 0, canvas.width, canvas.height)
+    const source = transformCacheBitmap.value ?? transformCacheCanvas.value
+    if (source) {
+      ctx.drawImage(source, 0, 0, rect.width, rect.height)
+    }
+    return
+  }
+  if (strokes.value.length > 0 || baseRasterDataUrl.value) {
+    void renderAllStrokes()
+    return
+  }
   if (hasBackup) {
     ctx.drawImage(backup, 0, 0, backup.width, backup.height, 0, 0, rect.width, rect.height)
   }
@@ -245,9 +268,9 @@ function axisPointAt(index: number, dir: 1 | -1): Point {
   }
 }
 
-function reflectPoint(point: Point, axisAngle: number): Point {
-  const cx = centerPixels.value.x
-  const cy = centerPixels.value.y
+function reflectPoint(point: Point, axisAngle: number, centerPx: Point): Point {
+  const cx = centerPx.x
+  const cy = centerPx.y
   const vx = Math.cos(axisAngle)
   const vy = Math.sin(axisAngle)
   const dx = point.x - cx
@@ -263,56 +286,76 @@ function reflectPoint(point: Point, axisAngle: number): Point {
   }
 }
 
-function drawBlurDot(ctx: CanvasRenderingContext2D, point: Point, color: string, baseSize: number) {
-  const size = baseSize * (0.7 + Math.random() * 0.5)
-  const alpha = 0.06 + Math.random() * 0.14
+function drawBlurDot(
+  ctx: CanvasRenderingContext2D,
+  point: Point,
+  color: string,
+  baseSize: number,
+  rng: Rng,
+) {
+  const size = baseSize * (0.7 + rng() * 0.5)
+  const alpha = 0.06 + rng() * 0.14
   ctx.fillStyle = hexToRgba(color, alpha)
   ctx.beginPath()
   ctx.arc(point.x, point.y, size, 0, Math.PI * 2)
   ctx.fill()
 }
 
-function drawSegment(ctx: CanvasRenderingContext2D, from: Point, to: Point, color: string) {
+function drawSegment(
+  ctx: CanvasRenderingContext2D,
+  from: Point,
+  to: Point,
+  brush: BrushSettings,
+  rng: Rng,
+) {
   const layers = 3
-  const base = Math.max(1, props.brushSize)
-  const baseOpacity = Math.min(1, Math.max(0.1, props.brushOpacity / 100))
-  const sizeRandomness = Math.min(1, Math.max(0, props.brushSizeRandomness / 100))
-  const opacityRandomness = Math.min(1, Math.max(0, props.brushOpacityRandomness / 100))
+  const rect = drawableRect.value
+  const basis = Math.max(1, Math.min(rect.width, rect.height))
+  const base = Math.max(
+    1,
+    (brush.brushSizeRel ?? 0) > 0 ? brush.brushSizeRel! * basis : brush.brushSize,
+  )
+  const baseOpacity = Math.min(1, Math.max(0.1, brush.brushOpacity / 100))
+  const sizeRandomness = Math.min(1, Math.max(0, brush.brushSizeRandomness / 100))
+  const opacityRandomness = Math.min(1, Math.max(0, brush.brushOpacityRandomness / 100))
   for (let i = 0; i < layers; i += 1) {
     const minThickness = Math.max(0.6, base * Math.max(0.15, 1 - sizeRandomness * 0.85))
     const maxThickness = Math.max(minThickness + 0.2, base * (1 + sizeRandomness * 2.8))
-    const thickness = minThickness + Math.random() * (maxThickness - minThickness)
+    const thickness = minThickness + rng() * (maxThickness - minThickness)
     const minOpacity = Math.max(0.06, 0.24 - opacityRandomness * 0.2)
     const maxOpacity = Math.min(0.95, 0.42 + opacityRandomness * 0.45)
-    const opacity = Math.min(
-      0.98,
-      (minOpacity + Math.random() * (maxOpacity - minOpacity)) * baseOpacity,
-    )
+    const opacity = Math.min(0.98, (minOpacity + rng() * (maxOpacity - minOpacity)) * baseOpacity)
     const jitter = Math.max(0.2, base * (0.08 + sizeRandomness * 0.46))
-    const jx1 = (Math.random() - 0.5) * jitter
-    const jy1 = (Math.random() - 0.5) * jitter
-    const jx2 = (Math.random() - 0.5) * jitter
-    const jy2 = (Math.random() - 0.5) * jitter
-    ctx.strokeStyle = hexToRgba(color, opacity)
+    const jx1 = (rng() - 0.5) * jitter
+    const jy1 = (rng() - 0.5) * jitter
+    const jx2 = (rng() - 0.5) * jitter
+    const jy2 = (rng() - 0.5) * jitter
+    ctx.strokeStyle = hexToRgba(brush.brushColor, opacity)
     ctx.lineWidth = thickness
     ctx.beginPath()
     ctx.moveTo(from.x + jx1, from.y + jy1)
     ctx.lineTo(to.x + jx2, to.y + jy2)
     ctx.stroke()
-    if (Math.random() > 0.42) {
-      drawBlurDot(ctx, to, color, thickness * 0.42)
+    if (rng() > 0.42) {
+      drawBlurDot(ctx, to, brush.brushColor, thickness * 0.42, rng)
     }
   }
 }
 
-function drawSymmetry(fromCanvas: Point, toCanvas: Point) {
+function drawSymmetry(
+  fromCanvas: Point,
+  toCanvas: Point,
+  brush: BrushSettings,
+  rng: Rng,
+  snapshot: { axisAngles: number[]; centerPx: Point },
+) {
   const canvas = canvasRef.value
   if (!canvas) return
   const ctx = canvas.getContext('2d')
   if (!ctx) return
 
-  if (props.freeDraw) {
-    drawSegment(ctx, fromCanvas, toCanvas, props.brushColor)
+  if (brush.freeDraw) {
+    drawSegment(ctx, fromCanvas, toCanvas, brush, rng)
     return
   }
 
@@ -321,17 +364,17 @@ function drawSymmetry(fromCanvas: Point, toCanvas: Point) {
   const toAbs = { x: toCanvas.x + rect.left, y: toCanvas.y + rect.top }
 
   const basePairs: Array<{ from: Point; to: Point }> = [{ from: fromAbs, to: toAbs }]
-  for (const angle of axisAngles.value) {
+  for (const angle of snapshot.axisAngles) {
     basePairs.push({
-      from: reflectPoint(fromAbs, angle),
-      to: reflectPoint(toAbs, angle),
+      from: reflectPoint(fromAbs, angle, snapshot.centerPx),
+      to: reflectPoint(toAbs, angle, snapshot.centerPx),
     })
   }
 
   for (const pair of basePairs) {
     const start = { x: pair.from.x - rect.left, y: pair.from.y - rect.top }
     const end = { x: pair.to.x - rect.left, y: pair.to.y - rect.top }
-    drawSegment(ctx, start, end, props.brushColor)
+    drawSegment(ctx, start, end, brush, rng)
   }
 }
 
@@ -341,18 +384,37 @@ function getCurrentDrawingDataUrl(): string {
   return canvas.toDataURL('image/png')
 }
 
-function clearUndoHistory() {
-  undoStack.value = []
+function normalizeCanvasPoint(point: Point): Point01 {
+  const rect = drawableRect.value
+  const x = rect.width > 0 ? point.x / rect.width : 0
+  const y = rect.height > 0 ? point.y / rect.height : 0
+  return { x: Math.min(1, Math.max(0, x)), y: Math.min(1, Math.max(0, y)) }
 }
 
-function pushUndoSnapshot(snapshot: string) {
-  const last = undoStack.value[undoStack.value.length - 1]
-  if (last === snapshot) return
-  const next = [...undoStack.value, snapshot]
-  if (next.length > UNDO_LIMIT) {
-    next.splice(0, next.length - UNDO_LIMIT)
+function brushSettings(): BrushSettings {
+  const rect = drawableRect.value
+  const basis = Math.max(1, Math.min(rect.width, rect.height))
+  return {
+    brushColor: props.brushColor,
+    brushSize: props.brushSize,
+    brushSizeRel: props.brushSize / basis,
+    brushOpacity: props.brushOpacity,
+    brushSizeRandomness: props.brushSizeRandomness,
+    brushOpacityRandomness: props.brushOpacityRandomness,
+    freeDraw: props.freeDraw,
   }
-  undoStack.value = next
+}
+
+function isSameBrush(a: BrushSettings, b: BrushSettings): boolean {
+  return (
+    a.brushColor === b.brushColor &&
+    a.brushSize === b.brushSize &&
+    a.brushSizeRel === b.brushSizeRel &&
+    a.brushOpacity === b.brushOpacity &&
+    a.brushSizeRandomness === b.brushSizeRandomness &&
+    a.brushOpacityRandomness === b.brushOpacityRandomness &&
+    a.freeDraw === b.freeDraw
+  )
 }
 
 function beginDrawing(event: PointerEvent) {
@@ -369,10 +431,27 @@ function beginDrawing(event: PointerEvent) {
   if (!localPoint) return
   const canvasPoint = toCanvasPoint(localPoint)
   if (!canvasPoint) return
-  strokeStartSnapshot.value = getCurrentDrawingDataUrl()
   hasStrokeChanges.value = false
   isDrawing.value = true
   lastPoint.value = canvasPoint
+  const brush = brushSettings()
+  const seed = randomSeed()
+  const rect = drawableRect.value
+  activeStroke.value = {
+    record: {
+      version: 1,
+      seed,
+      points: [normalizeCanvasPoint(canvasPoint)],
+      axis: {
+        center: { x: center.value.x, y: center.value.y },
+        axisAngles: axisAngles.value.slice(),
+      },
+      brushTimeline: [{ atPointIndex: 0, brush }],
+      meta: { canvasWidth: rect.width, canvasHeight: rect.height },
+    },
+    rng: createRng(seed),
+    lastBrush: brush,
+  }
 }
 
 function continueDrawing(event: PointerEvent) {
@@ -390,7 +469,24 @@ function continueDrawing(event: PointerEvent) {
   if (!canvasPoint) return
   const previous = lastPoint.value
   if (!previous) return
-  drawSymmetry(previous, canvasPoint)
+  const snapshot = activeStroke.value
+  if (!snapshot) return
+  const nextBrush = brushSettings()
+  if (!isSameBrush(snapshot.lastBrush, nextBrush)) {
+    snapshot.lastBrush = nextBrush
+    snapshot.record.brushTimeline.push({
+      atPointIndex: Math.max(0, snapshot.record.points.length - 1),
+      brush: nextBrush,
+    })
+  }
+  drawSymmetry(previous, canvasPoint, nextBrush, snapshot.rng, {
+    axisAngles: snapshot.record.axis.axisAngles,
+    centerPx: {
+      x: snapshot.record.axis.center.x * paperWidth.value,
+      y: snapshot.record.axis.center.y * paperHeight.value,
+    },
+  })
+  snapshot.record.points.push(normalizeCanvasPoint(canvasPoint))
   hasStrokeChanges.value = true
   lastPoint.value = canvasPoint
 }
@@ -399,29 +495,33 @@ function stopDrawing() {
   const wasDrawing = isDrawing.value
   isDrawing.value = false
   lastPoint.value = null
-  if (wasDrawing && hasStrokeChanges.value && strokeStartSnapshot.value !== null) {
-    pushUndoSnapshot(strokeStartSnapshot.value)
+  if (wasDrawing && hasStrokeChanges.value && activeStroke.value) {
+    const record = activeStroke.value.record
+    if (record.points.length >= 2) {
+      strokes.value = [...strokes.value, record]
+    }
   }
   hasStrokeChanges.value = false
-  strokeStartSnapshot.value = null
+  activeStroke.value = null
 }
 
-function clearDrawing(resetUndo = true) {
+function clearDrawing(resetHistory = true) {
   const canvas = canvasRef.value
   if (!canvas) return
   const ctx = canvas.getContext('2d')
   if (!ctx) return
   ctx.clearRect(0, 0, canvas.width, canvas.height)
-  if (resetUndo) {
-    clearUndoHistory()
+  if (resetHistory) {
+    baseRasterDataUrl.value = ''
+    strokes.value = []
   }
 }
 
 async function undoLastStroke(): Promise<boolean> {
   if (isBurning.value || isDrawing.value) return false
-  const snapshot = undoStack.value.pop()
-  if (snapshot === undefined) return false
-  await drawDataUrl(snapshot)
+  if (strokes.value.length === 0) return false
+  strokes.value = strokes.value.slice(0, -1)
+  await renderAllStrokes()
   return true
 }
 
@@ -460,6 +560,8 @@ function burnAndReset() {
   stopDrawing()
   stopDrag()
   stopDrawableDrag()
+  baseRasterDataUrl.value = ''
+  strokes.value = []
   burnProgress.value = 0
   emit('burning-progress', 0)
   burnTrailParticles.value = createBurnTrailParticles()
@@ -755,7 +857,214 @@ async function drawDataUrl(dataUrl: string) {
   if (!ctx) return
   const image = await readImage(dataUrl)
   clearDrawing(false)
-  ctx.drawImage(image, 0, 0, canvas.width, canvas.height)
+  const rect = drawableRect.value
+  ctx.drawImage(image, 0, 0, rect.width, rect.height)
+}
+
+let renderSeq = 0
+
+function brushAtPointIndex(record: StrokeRecord, pointIndex: number): BrushSettings {
+  let current = record.brushTimeline[0]?.brush ?? brushSettings()
+  for (const keyframe of record.brushTimeline) {
+    if (keyframe.atPointIndex > pointIndex) break
+    current = keyframe.brush
+  }
+  return current
+}
+
+async function renderAllStrokes() {
+  const seq = (renderSeq += 1)
+  const canvas = canvasRef.value
+  if (!canvas) return
+  const ctx = canvas.getContext('2d')
+  if (!ctx) return
+  ctx.clearRect(0, 0, canvas.width, canvas.height)
+  if (baseRasterDataUrl.value) {
+    try {
+      await drawDataUrl(baseRasterDataUrl.value)
+    } catch {
+      baseRasterDataUrl.value = ''
+    }
+  }
+  if (seq !== renderSeq) return
+
+  const rect = drawableRect.value
+  for (const record of strokes.value) {
+    const rng = createRng(record.seed)
+    const centerPx = {
+      x: record.axis.center.x * paperWidth.value,
+      y: record.axis.center.y * paperHeight.value,
+    }
+    const points = record.points.map((p) => ({ x: p.x * rect.width, y: p.y * rect.height }))
+    for (let i = 0; i < points.length - 1; i += 1) {
+      const brush = brushAtPointIndex(record, i)
+      drawSymmetry(points[i]!, points[i + 1]!, brush, rng, {
+        axisAngles: record.axis.axisAngles,
+        centerPx,
+      })
+    }
+  }
+}
+
+function getDrawingStrokes(): StrokeRecord[] {
+  return strokes.value.map((stroke) => ({
+    version: stroke.version,
+    seed: stroke.seed,
+    points: stroke.points.map((p) => ({ x: p.x, y: p.y })),
+    axis: {
+      center: { x: stroke.axis.center.x, y: stroke.axis.center.y },
+      axisAngles: stroke.axis.axisAngles.slice(),
+    },
+    brushTimeline: stroke.brushTimeline.map((k) => ({
+      atPointIndex: k.atPointIndex,
+      brush: { ...k.brush },
+    })),
+    meta: { canvasWidth: stroke.meta.canvasWidth, canvasHeight: stroke.meta.canvasHeight },
+  }))
+}
+
+function getDrawingStats(): DrawingStats {
+  const rect = drawableRect.value
+  let pointCount = 0
+  for (const stroke of strokes.value) {
+    pointCount += stroke.points.length
+  }
+  return {
+    canvasWidth: rect.width,
+    canvasHeight: rect.height,
+    strokeCount: strokes.value.length,
+    pointCount,
+  }
+}
+
+async function getPreviewBlob(maxWidth = 260): Promise<Blob | null> {
+  const canvas = canvasRef.value
+  if (!canvas) return null
+  const rect = drawableRect.value
+  if (rect.width <= 0 || rect.height <= 0) return null
+  const scale = Math.min(1, maxWidth / rect.width)
+  const out = document.createElement('canvas')
+  out.width = Math.max(1, Math.round(rect.width * scale))
+  out.height = Math.max(1, Math.round(rect.height * scale))
+  const outCtx = out.getContext('2d')
+  if (!outCtx) return null
+  outCtx.imageSmoothingEnabled = true
+  outCtx.imageSmoothingQuality = 'high'
+  outCtx.drawImage(canvas, 0, 0, out.width, out.height)
+  return new Promise((resolve) => {
+    out.toBlob((blob) => resolve(blob), 'image/webp', 0.86)
+  })
+}
+
+async function applyDrawingDataUrl(dataUrl: string) {
+  baseRasterDataUrl.value = dataUrl
+  strokes.value = []
+  await renderAllStrokes()
+}
+
+async function applyDrawingStrokes(
+  next: StrokeRecord[],
+  snapshotDrawableBox: DrawableBox | null = null,
+) {
+  const sanitized = next
+    .map((stroke) => {
+      if (stroke.version !== 1) return null
+      if (!Number.isFinite(stroke.seed)) return null
+      const points = stroke.points
+        .map((p) => ({
+          x: Number.isFinite(p.x) ? Math.min(1, Math.max(0, p.x)) : 0,
+          y: Number.isFinite(p.y) ? Math.min(1, Math.max(0, p.y)) : 0,
+        }))
+        .filter((p) => Number.isFinite(p.x) && Number.isFinite(p.y))
+      if (points.length < 2) return null
+      const axisAnglesSanitized = stroke.axis.axisAngles.map((angle) => normalizeLineAngle(angle))
+      const centerSanitized = {
+        x: Math.min(0.9, Math.max(0.1, stroke.axis.center.x)),
+        y: Math.min(0.9, Math.max(0.1, stroke.axis.center.y)),
+      }
+      const brushTimeline = stroke.brushTimeline
+        .map((k) => ({
+          atPointIndex: Number.isFinite(k.atPointIndex)
+            ? Math.max(0, Math.round(k.atPointIndex))
+            : 0,
+          brush: {
+            brushColor: k.brush.brushColor,
+            brushSize: k.brush.brushSize,
+            brushSizeRel: Number.isFinite(k.brush.brushSizeRel)
+              ? Math.max(0, k.brush.brushSizeRel ?? 0)
+              : 0,
+            brushOpacity: k.brush.brushOpacity,
+            brushSizeRandomness: k.brush.brushSizeRandomness,
+            brushOpacityRandomness: k.brush.brushOpacityRandomness,
+            freeDraw: Boolean(k.brush.freeDraw),
+          },
+        }))
+        .sort((a, b) => a.atPointIndex - b.atPointIndex)
+      const meta = {
+        canvasWidth: Number.isFinite(stroke.meta.canvasWidth)
+          ? Math.max(1, stroke.meta.canvasWidth)
+          : 1,
+        canvasHeight: Number.isFinite(stroke.meta.canvasHeight)
+          ? Math.max(1, stroke.meta.canvasHeight)
+          : 1,
+      }
+      const metaBasis = Math.max(1, Math.min(meta.canvasWidth, meta.canvasHeight))
+      for (const keyframe of brushTimeline) {
+        if (!keyframe.brush.brushSizeRel) {
+          keyframe.brush.brushSizeRel = Math.max(0, keyframe.brush.brushSize / metaBasis)
+        }
+      }
+      return {
+        version: 1,
+        seed: Math.round(stroke.seed) >>> 0,
+        points,
+        axis: { center: centerSanitized, axisAngles: axisAnglesSanitized },
+        brushTimeline:
+          brushTimeline.length > 0 ? brushTimeline : [{ atPointIndex: 0, brush: brushSettings() }],
+        meta,
+      } satisfies StrokeRecord
+    })
+    .filter((stroke): stroke is StrokeRecord => stroke !== null)
+  baseRasterDataUrl.value = ''
+  strokes.value = sanitized
+  if (snapshotDrawableBox) {
+    emit('update:drawableBox', sanitizeDrawableBox(snapshotDrawableBox))
+  }
+  await nextTick()
+  await renderAllStrokes()
+}
+
+async function captureTransformCache() {
+  const canvas = canvasRef.value
+  if (!canvas) return
+  try {
+    if (transformCacheBitmap.value) {
+      transformCacheBitmap.value.close()
+      transformCacheBitmap.value = null
+    }
+    transformCacheCanvas.value = null
+    if (typeof createImageBitmap === 'function') {
+      transformCacheBitmap.value = await createImageBitmap(canvas)
+      return
+    }
+  } catch {
+    transformCacheBitmap.value = null
+  }
+  const fallback = document.createElement('canvas')
+  fallback.width = canvas.width
+  fallback.height = canvas.height
+  const ctx = fallback.getContext('2d')
+  if (!ctx) return
+  ctx.drawImage(canvas, 0, 0)
+  transformCacheCanvas.value = fallback
+}
+
+function clearTransformCache() {
+  if (transformCacheBitmap.value) {
+    transformCacheBitmap.value.close()
+    transformCacheBitmap.value = null
+  }
+  transformCacheCanvas.value = null
 }
 
 async function applySnapshot(snapshot: PaperSnapshot) {
@@ -765,8 +1074,9 @@ async function applySnapshot(snapshot: PaperSnapshot) {
   }
   axisAngles.value = snapshot.axisAngles.map((angle) => normalizeLineAngle(angle))
   await nextTick()
-  await drawDataUrl(snapshot.drawingDataUrl)
-  clearUndoHistory()
+  baseRasterDataUrl.value = snapshot.drawingDataUrl
+  strokes.value = []
+  await renderAllStrokes()
 }
 
 function applyPreset(state: PaperPresetState) {
@@ -805,7 +1115,13 @@ watch(
 watch(
   () => props.showPaperTransformEditor,
   (visible) => {
-    if (!visible) stopPaperTransform()
+    if (visible) {
+      void captureTransformCache()
+      return
+    }
+    stopPaperTransform()
+    clearTransformCache()
+    void renderAllStrokes()
   },
 )
 
@@ -844,6 +1160,7 @@ onMounted(() => {
 })
 
 onBeforeUnmount(() => {
+  clearTransformCache()
   if (resizeObserver && paperRef.value) {
     resizeObserver.unobserve(paperRef.value)
   }
@@ -870,7 +1187,11 @@ defineExpose({
   resetAxesEven,
   getSnapshot,
   getDrawingDataUrl: getCurrentDrawingDataUrl,
-  applyDrawingDataUrl: drawDataUrl,
+  getDrawingStrokes,
+  getDrawingStats,
+  getPreviewBlob,
+  applyDrawingDataUrl,
+  applyDrawingStrokes,
   applySnapshot,
   applyPreset,
 })
